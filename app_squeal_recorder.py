@@ -83,6 +83,7 @@ TAG_COLORS = {
     "TOR": "#ef4444",
     "Flange": "#f97316",
     "NotWheel": "#6b7280",
+    "NotSqueal": "#3b82f6",
     "Untagged": "#22d3ee",
 }
 
@@ -681,6 +682,111 @@ def _clip_key(clip: Dict) -> str:
 
 
 # ============================================================
+# Annotation helpers
+# ============================================================
+
+def _ann_wav_filename(clip: Dict, ann: Dict) -> str:
+    src = clip.get("source", "auto")
+    cid = int(clip["clip_id"])
+    aid = int(ann["ann_id"])
+    return f"clip_{src}_{cid:04d}_ann{aid:03d}_{ann['tag']}.wav"
+
+
+def annotation_to_wav_bytes(clip: Dict, ann: Dict) -> bytes:
+    sr = int(clip["sample_rate_hz"])
+    pcm = np.asarray(clip["pcm16"], dtype=np.int16)
+    s0 = max(0, int(ann["t_start"] * sr))
+    s1 = min(len(pcm), int(ann["t_end"] * sr))
+    buf = io.BytesIO()
+    wavfile.write(buf, sr, pcm[s0:s1])
+    return buf.getvalue()
+
+
+def annotation_to_json_bytes(clip: Dict, ann: Dict, clip_tag: str) -> bytes:
+    wav_filename = _ann_wav_filename(clip, ann)
+    meta = {
+        "clip_id": clip["clip_id"],
+        "source": clip.get("source", "auto"),
+        "clip_tag": clip_tag,
+        "ann_id": ann["ann_id"],
+        "ann_tag": ann["tag"],
+        "t_start": ann["t_start"],
+        "t_end": ann["t_end"],
+        "f_low": ann["f_low"],
+        "f_high": ann["f_high"],
+        "duration_s": ann["duration_s"],
+        "notes": ann.get("notes", ""),
+        "sample_rate_hz": int(clip.get("sample_rate_hz", 16000)),
+        "lat": clip.get("lat"),
+        "lon": clip.get("lon"),
+        "speed_kmh": round(float(clip["speed_kmh"]), 2) if clip.get("speed_kmh") is not None else None,
+        "utc": clip.get("utc"),
+        "wav_filename": wav_filename,
+    }
+    return json.dumps(meta, indent=2).encode("utf-8")
+
+
+def _background_segments(duration_s: float, annotations: List[Dict]) -> List[Tuple[float, float]]:
+    """Time intervals not covered by any annotation (min gap 0.05 s)."""
+    if not annotations:
+        return [(0.0, duration_s)]
+    events = sorted(annotations, key=lambda a: a["t_start"])
+    gaps: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for ann in events:
+        if ann["t_start"] > cursor + 0.05:
+            gaps.append((cursor, ann["t_start"]))
+        cursor = max(cursor, ann["t_end"])
+    if duration_s - cursor > 0.05:
+        gaps.append((cursor, duration_s))
+    return gaps
+
+
+def build_annotation_export_zip(clip: Dict, annotations: List[Dict], clip_tag: str) -> bytes:
+    """ZIP of per-annotation WAV+JSON slices plus background (NotSqueal) segments."""
+    sr = int(clip["sample_rate_hz"])
+    pcm = np.asarray(clip["pcm16"], dtype=np.int16)
+    duration_s = float(clip.get("duration_s", len(pcm) / sr))
+    src = clip.get("source", "auto")
+    cid = int(clip["clip_id"])
+    buf = io.BytesIO()
+    catalog: List[Dict] = []
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for ann in annotations:
+            wav_bytes = annotation_to_wav_bytes(clip, ann)
+            json_bytes = annotation_to_json_bytes(clip, ann, clip_tag)
+            wav_name = _ann_wav_filename(clip, ann)
+            zf.writestr(wav_name, wav_bytes)
+            zf.writestr(wav_name.replace(".wav", ".json"), json_bytes)
+            catalog.append(json.loads(json_bytes.decode()))
+        for i, (t0, t1) in enumerate(_background_segments(duration_s, annotations), start=1):
+            s0 = max(0, int(t0 * sr))
+            s1 = min(len(pcm), int(t1 * sr))
+            bg_wav_buf = io.BytesIO()
+            wavfile.write(bg_wav_buf, sr, pcm[s0:s1])
+            bg_wav_name = f"clip_{src}_{cid:04d}_bg{i:03d}_NotSqueal.wav"
+            bg_meta = {
+                "clip_id": cid,
+                "source": src,
+                "ann_tag": "NotSqueal",
+                "t_start": round(t0, 4),
+                "t_end": round(t1, 4),
+                "duration_s": round(t1 - t0, 4),
+                "sample_rate_hz": sr,
+                "lat": clip.get("lat"),
+                "lon": clip.get("lon"),
+                "speed_kmh": round(float(clip["speed_kmh"]), 2) if clip.get("speed_kmh") is not None else None,
+                "utc": clip.get("utc"),
+                "wav_filename": bg_wav_name,
+            }
+            zf.writestr(bg_wav_name, bg_wav_buf.getvalue())
+            zf.writestr(bg_wav_name.replace(".wav", ".json"), json.dumps(bg_meta, indent=2).encode())
+            catalog.append(bg_meta)
+        zf.writestr("catalog.json", json.dumps(catalog, indent=2).encode())
+    return buf.getvalue()
+
+
+# ============================================================
 # Plots
 # ============================================================
 
@@ -749,6 +855,56 @@ def build_spectrogram_figure(freqs: np.ndarray, times_s: np.ndarray, spec_db: np
     return fig
 
 
+def build_annotated_spectrogram(
+    freqs: np.ndarray,
+    times_s: np.ndarray,
+    spec_db: np.ndarray,
+    band_low: float,
+    band_high: float,
+    annotations: Optional[List[Dict]] = None,
+) -> go.Figure:
+    """Spectrogram with dragmode=select and annotation rectangle overlays."""
+    fig = go.Figure(data=go.Heatmap(
+        x=times_s, y=freqs, z=spec_db,
+        colorscale="Turbo", colorbar=dict(title="dB"),
+        hoverinfo="x+y+z",
+    ))
+    fig.add_hrect(y0=band_low, y1=band_high, line_width=1, line_dash="dash", line_color="cyan", opacity=0.15)
+    for ann in (annotations or []):
+        color = TAG_COLORS.get(ann["tag"], "#ffffff")
+        fig.add_shape(
+            type="rect",
+            x0=ann["t_start"], x1=ann["t_end"],
+            y0=ann["f_low"], y1=ann["f_high"],
+            line=dict(color=color, width=2),
+            fillcolor=color, opacity=0.25,
+            layer="above",
+        )
+        fig.add_annotation(
+            x=(ann["t_start"] + ann["t_end"]) / 2,
+            y=ann["f_high"],
+            text=f"#{ann['ann_id']} {ann['tag']}",
+            showarrow=False,
+            font=dict(color=color, size=10, family="monospace"),
+            bgcolor="rgba(0,0,0,0.55)",
+            bordercolor=color,
+            borderpad=2,
+        )
+    fig.update_layout(
+        title="Spectrogram — drag to select a squeal region, then save below",
+        template="plotly_dark",
+        xaxis_title="Time [s]",
+        yaxis_title="Frequency [Hz]",
+        height=370,
+        margin=dict(l=10, r=10, t=50, b=10),
+        uirevision="ann_spec",
+        dragmode="select",
+        selectdirection="any",
+        newselection=dict(mode="gradual"),
+    )
+    return fig
+
+
 def build_map(df: pd.DataFrame, height_px: int) -> pdk.Deck:
     if df.empty or "lat" not in df.columns or "lon" not in df.columns:
         df = pd.DataFrame({"lat": [59.9127], "lon": [10.7461], "rms": [0.1], "trigger_reason": ["n/a"]})
@@ -779,17 +935,15 @@ def build_map(df: pd.DataFrame, height_px: int) -> pdk.Deck:
 
 
 # ============================================================
-# Live fragment (auto-refreshing)
+# Live fragments (auto-refreshing, split to reduce chart flicker)
 # ============================================================
 
 @st.fragment(run_every=0.5)
-def render_live_fragment(cfg: AppConfig) -> None:
+def render_metrics_fragment(cfg: AppConfig) -> None:
+    """Fast-refresh status metrics — does not contain charts so no flicker."""
     manager = get_live_manager(cfg)
     status = manager.latest_status()
-    sr, pcm = manager.latest_audio_seconds(cfg.live_wave_seconds)
-    signal = pcm.astype(np.float32) / 32768.0 if pcm.size else np.array([], dtype=np.float32)
 
-    # Row 1 — connection + clip counts
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Serial", "Connected" if status["connected"] else "Disconnected")
     c2.metric("Rate", f"{status['sample_rate_hz']} Hz")
@@ -798,28 +952,22 @@ def render_live_fragment(cfg: AppConfig) -> None:
     c5.metric("Buttons", int(status["button_count"]))
     c6.metric("Link age", "n/a" if status["last_packet_age_s"] is None else f"{status['last_packet_age_s']:.2f} s")
 
-    # Row 2 — GPS + audio frame metrics
     latest_telem = status.get("latest_telemetry", {}) or {}
     gps_valid = bool(latest_telem.get("gps_valid", False))
     lat_val = latest_telem.get("lat")
     lon_val = latest_telem.get("lon")
     utc_val = latest_telem.get("utc")
-    speed_kmh = _extract_speed_kmh(latest_telem)
     manual_override = st.session_state.get("manual_speed_kmh") if st.session_state.get("use_manual_speed") else None
     active_spd, spd_source = _active_speed(latest_telem, manual_override)
 
     if spd_source == "gps":
-        speed_display = f"{active_spd:.1f} km/h"
-        speed_label = "Speed (GPS)"
+        speed_display, speed_label = f"{active_spd:.1f} km/h", "Speed (GPS)"
     elif spd_source == "gps_stale":
-        speed_display = f"{active_spd:.1f} km/h ⚠"
-        speed_label = "Speed (stale)"
+        speed_display, speed_label = f"{active_spd:.1f} km/h ⚠", "Speed (stale)"
     elif spd_source == "manual":
-        speed_display = f"{active_spd:.1f} km/h"
-        speed_label = "Speed (manual)"
+        speed_display, speed_label = f"{active_spd:.1f} km/h", "Speed (manual)"
     else:
-        speed_display = "n/a"
-        speed_label = "Speed"
+        speed_display, speed_label = "n/a", "Speed"
 
     fm = status.get("last_frame_metrics", {})
     g1, g2, g3, g4, g5, g6, g7, g8 = st.columns(8)
@@ -835,17 +983,33 @@ def render_live_fragment(cfg: AppConfig) -> None:
     if status["recording_active"]:
         st.warning("RECORDING — click **Stop recording** to save.")
 
+
+@st.fragment(run_every=1.5)
+def render_charts_fragment(cfg: AppConfig) -> None:
+    """Slower-refresh waveform + spectrogram — separate fragment reduces flicker."""
+    manager = get_live_manager(cfg)
+    sr, pcm = manager.latest_audio_seconds(cfg.live_wave_seconds)
+    signal = pcm.astype(np.float32) / 32768.0 if pcm.size else np.array([], dtype=np.float32)
+
     left, right = st.columns(2)
     with left:
         if signal.size:
-            st.plotly_chart(build_waveform_figure(signal, sr, cfg.live_wave_seconds, cfg.live_plot_points, title="Live waveform"), use_container_width=True)
+            st.plotly_chart(
+                build_waveform_figure(signal, sr, cfg.live_wave_seconds, cfg.live_plot_points, title="Live waveform"),
+                use_container_width=True,
+                key="live_waveform",
+            )
         else:
             st.info("Waiting for audio frames.")
     with right:
         spec = manager.get_cached_spectrogram()
         if spec is not None:
             freqs, times_s, spec_db = spec
-            st.plotly_chart(build_spectrogram_figure(freqs, times_s, spec_db, cfg.squeal_band_low_hz, cfg.squeal_band_high_hz), use_container_width=True)
+            st.plotly_chart(
+                build_spectrogram_figure(freqs, times_s, spec_db, cfg.squeal_band_low_hz, cfg.squeal_band_high_hz),
+                use_container_width=True,
+                key="live_spectrogram",
+            )
         else:
             st.info("Waiting for enough samples for spectrogram.")
 
@@ -920,7 +1084,8 @@ def render_live_tab(cfg: AppConfig) -> None:
     else:
         manager.set_manual_speed(None)
 
-    render_live_fragment(cfg)
+    render_metrics_fragment(cfg)
+    render_charts_fragment(cfg)
 
     # ---- Clip browser --------------------------------------------------
     st.divider()
@@ -1016,10 +1181,6 @@ def render_live_tab(cfg: AppConfig) -> None:
         use_container_width=True,
     )
     freqs, times_s, spec_db = compute_spectrogram(clip_signal, int(clip["sample_rate_hz"]), cfg.spectrogram_nperseg, cfg.spectrogram_noverlap)
-    st.plotly_chart(
-        build_spectrogram_figure(freqs, times_s, spec_db, cfg.squeal_band_low_hz, cfg.squeal_band_high_hz),
-        use_container_width=True,
-    )
 
     # Per-clip downloads
     dl1, dl2 = st.columns(2)
@@ -1040,6 +1201,95 @@ def render_live_tab(cfg: AppConfig) -> None:
             mime="application/json",
             use_container_width=True,
         )
+
+    # ---- Annotation section --------------------------------------------
+    st.divider()
+    st.subheader("Annotate squeal events")
+    st.caption(
+        "Draw a box on the spectrogram to mark a suspected squeal region. "
+        "Save it with a tag. Multiple annotations per clip are supported — "
+        "audio outside all boxes is exported as **NotSqueal** (negative training examples)."
+    )
+
+    ann_list = st.session_state.annotations.get(clip_key, [])
+    ann_fig = build_annotated_spectrogram(
+        freqs, times_s, spec_db,
+        cfg.squeal_band_low_hz, cfg.squeal_band_high_hz,
+        annotations=ann_list,
+    )
+    event = st.plotly_chart(
+        ann_fig,
+        use_container_width=True,
+        on_select="rerun",
+        key=f"ann_spec_{clip_key}",
+    )
+
+    # Extract the selected box (if any)
+    sel_box: list = []
+    try:
+        sel_box = (event.selection or {}).get("box", [])
+    except Exception:
+        pass
+
+    if sel_box:
+        box = sel_box[0]
+        t_lo = float(min(box["x"]))
+        t_hi = float(max(box["x"]))
+        f_lo = float(min(box["y"]))
+        f_hi = float(max(box["y"]))
+        dur = t_hi - t_lo
+        st.info(
+            f"Selection: **{t_lo:.3f} s – {t_hi:.3f} s** · "
+            f"**{f_lo:.0f} – {f_hi:.0f} Hz** · duration {dur:.3f} s"
+        )
+        af1, af2, af3 = st.columns([2, 2, 1])
+        with af1:
+            ann_tag = st.radio(
+                "Event type", TAG_OPTIONS[1:], horizontal=True,
+                key=f"ann_tag_{clip_key}",
+            )
+        with af2:
+            ann_notes = st.text_input("Notes (optional)", key=f"ann_notes_{clip_key}")
+        with af3:
+            if st.button("Save annotation", key=f"ann_save_{clip_key}", type="primary"):
+                st.session_state.ann_counter += 1
+                new_ann = {
+                    "ann_id": st.session_state.ann_counter,
+                    "t_start": round(t_lo, 4),
+                    "t_end": round(t_hi, 4),
+                    "f_low": round(f_lo, 1),
+                    "f_high": round(f_hi, 1),
+                    "duration_s": round(dur, 4),
+                    "tag": ann_tag,
+                    "notes": ann_notes,
+                }
+                st.session_state.annotations.setdefault(clip_key, []).append(new_ann)
+                st.success(f"Annotation #{new_ann['ann_id']} saved: **{ann_tag}** · {t_lo:.3f}–{t_hi:.3f} s")
+
+    # Annotation list
+    ann_list = st.session_state.annotations.get(clip_key, [])
+    if ann_list:
+        st.write(f"**{len(ann_list)} annotation(s):**")
+        for i, ann in enumerate(ann_list):
+            ac1, ac2, ac3, ac4 = st.columns([1, 3, 3, 1])
+            ac1.write(f"**#{ann['ann_id']}** `{ann['tag']}`")
+            ac2.write(f"{ann['t_start']:.3f} s – {ann['t_end']:.3f} s ({ann['duration_s']:.3f} s)")
+            note_str = f" · _{ann['notes']}_" if ann.get("notes") else ""
+            ac3.write(f"{ann['f_low']:.0f} – {ann['f_high']:.0f} Hz{note_str}")
+            if ac4.button("Delete", key=f"del_ann_{ann['ann_id']}"):
+                st.session_state.annotations[clip_key].pop(i)
+                st.rerun()
+
+        src = clip.get("source", "auto")
+        cid = int(clip["clip_id"])
+        st.download_button(
+            "Export annotations + background segments (ZIP)",
+            data=build_annotation_export_zip(clip, ann_list, chosen_tag),
+            file_name=f"clip_{src}_{cid:04d}_annotated.zip",
+            mime="application/zip",
+        )
+    else:
+        st.caption("No annotations yet — draw a box on the spectrogram above.")
 
     # Diagnostics expander
     with st.expander("Telemetry and diagnostics"):
@@ -1116,6 +1366,10 @@ def main() -> None:
 
     if "clip_tags" not in st.session_state:
         st.session_state.clip_tags = {}
+    if "annotations" not in st.session_state:
+        st.session_state.annotations = {}
+    if "ann_counter" not in st.session_state:
+        st.session_state.ann_counter = 0
 
     tabs = st.tabs(["Live / Record", "Map", "Offline review"])
     with tabs[0]:
