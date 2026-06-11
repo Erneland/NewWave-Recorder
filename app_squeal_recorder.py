@@ -749,41 +749,37 @@ def render_live_fragment(cfg: AppConfig) -> None:
     sr, pcm = manager.latest_audio_seconds(cfg.live_wave_seconds)
     signal = pcm.astype(np.float32) / 32768.0 if pcm.size else np.array([], dtype=np.float32)
 
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    # Row 1 — connection + clip counts
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Serial", "Connected" if status["connected"] else "Disconnected")
     c2.metric("Rate", f"{status['sample_rate_hz']} Hz")
     c3.metric("Auto clips", int(status["auto_clip_count"]))
     c4.metric("Manual clips", int(status["manual_clip_count"]))
-    c5.metric("Telemetry", int(status["telemetry_count"]))
-    c6.metric("Button marks", int(status["button_count"]))
-    c7.metric("Link age", "n/a" if status["last_packet_age_s"] is None else f"{status['last_packet_age_s']:.2f} s")
+    c5.metric("Buttons", int(status["button_count"]))
+    c6.metric("Link age", "n/a" if status["last_packet_age_s"] is None else f"{status['last_packet_age_s']:.2f} s")
 
-    # GPS row
+    # Row 2 — GPS + audio frame metrics
     latest_telem = status.get("latest_telemetry", {}) or {}
     gps_valid = bool(latest_telem.get("gps_valid", False))
     lat_val = latest_telem.get("lat")
     lon_val = latest_telem.get("lon")
     utc_val = latest_telem.get("utc")
     speed_kmh = _extract_speed_kmh(latest_telem)
-
     speed_display = f"{speed_kmh:.1f} km/h" if speed_kmh is not None else "n/a"
 
-    g1, g2, g3, g4, g5 = st.columns(5)
-    g1.metric("LAT", "n/a" if lat_val is None else f"{float(lat_val):.6f}")
-    g2.metric("LON", "n/a" if lon_val is None else f"{float(lon_val):.6f}")
-    g3.metric("UTC", str(utc_val) if utc_val else ("No fix" if not gps_valid else "n/a"))
-    g4.metric("GPS speed", speed_display)
-    g5.metric("Clip active", "YES" if status["clip_active"] else "no")
+    fm = status.get("last_frame_metrics", {})
+    g1, g2, g3, g4, g5, g6, g7, g8 = st.columns(8)
+    g1.metric("LAT", "n/a" if lat_val is None else f"{float(lat_val):.5f}")
+    g2.metric("LON", "n/a" if lon_val is None else f"{float(lon_val):.5f}")
+    g3.metric("Speed", speed_display)
+    g4.metric("UTC", str(utc_val)[-8:] if utc_val else ("No fix" if not gps_valid else "n/a"))
+    g5.metric("RMS", f"{float(fm.get('rms', 0.0)):.4f}")
+    g6.metric("Band ratio", f"{float(fm.get('band_ratio', 0.0)):.3f}")
+    g7.metric("Peak", f"{float(fm.get('peak', 0.0)):.3f}")
+    g8.metric("Dom. Hz", f"{float(fm.get('dominant_freq_hz', 0.0)):.0f}")
 
     if status["recording_active"]:
         st.warning("RECORDING — click **Stop recording** to save.")
-
-    fm = status.get("last_frame_metrics", {})
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Frame RMS", f"{float(fm.get('rms', 0.0)):.4f}")
-    m2.metric("Band ratio", f"{float(fm.get('band_ratio', 0.0)):.3f}")
-    m3.metric("Peak", f"{float(fm.get('peak', 0.0)):.3f}")
-    m4.metric("Dominant Hz", f"{float(fm.get('dominant_freq_hz', 0.0)):.0f}")
 
     left, right = st.columns(2)
     with left:
