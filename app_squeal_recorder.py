@@ -87,6 +87,10 @@ TAG_COLORS = {
 }
 
 
+# GPS fix older than this is considered stale
+GPS_STALE_MS = 5000
+
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -102,6 +106,31 @@ def _extract_speed_kmh(telemetry: Dict) -> Optional[float]:
     except Exception:
         pass
     return None
+
+
+def _gps_speed_stale(telemetry: Dict) -> bool:
+    """True when the GPS location fix is older than GPS_STALE_MS."""
+    try:
+        loc_age = telemetry.get("loc_age_ms")
+        if loc_age is None:
+            return True
+        return float(loc_age) > GPS_STALE_MS
+    except Exception:
+        return True
+
+
+def _active_speed(telemetry: Dict, manual_override: Optional[float]) -> Tuple[Optional[float], str]:
+    """Return (speed_kmh, source) where source is 'gps', 'gps_stale', or 'manual'."""
+    gps_speed = _extract_speed_kmh(telemetry)
+    stale = _gps_speed_stale(telemetry)
+
+    if gps_speed is not None and not stale:
+        return gps_speed, "gps"
+    if manual_override is not None:
+        return manual_override, "manual"
+    if gps_speed is not None:
+        return gps_speed, "gps_stale"
+    return None, "unavailable"
 
 
 # ============================================================
@@ -179,7 +208,7 @@ class TriggeredClipRecorder:
         self.is_active = False
         self.captured.clear()
 
-    def _start_clip(self, trigger_reason: str, telemetry: Dict, button_mark: bool) -> None:
+    def _start_clip(self, trigger_reason: str, telemetry: Dict, button_mark: bool, speed_kmh: Optional[float] = None) -> None:
         self.is_active = True
         self.active_pcm = []
         preroll = self.pretrigger.get_last(self.preroll_samples)
@@ -199,7 +228,7 @@ class TriggeredClipRecorder:
             "lon": telemetry.get("lon"),
             "utc": telemetry.get("utc"),
             "gps_valid": telemetry.get("gps_valid"),
-            "speed_kmh": _extract_speed_kmh(telemetry),
+            "speed_kmh": speed_kmh,
             "sample_rate_hz": self.sample_rate_hz,
         }
 
@@ -228,12 +257,13 @@ class TriggeredClipRecorder:
         trigger_active: bool,
         trigger_reason: str,
         button_mark: bool,
+        speed_kmh: Optional[float] = None,
     ) -> Optional[Dict]:
         pcm = np.asarray(pcm, dtype=np.int16).reshape(-1)
         self.pretrigger.append(pcm)
 
         if trigger_active and not self.is_active:
-            self._start_clip(trigger_reason, telemetry, button_mark)
+            self._start_clip(trigger_reason, telemetry, button_mark, speed_kmh=speed_kmh)
 
         if self.is_active:
             self.active_pcm.append(pcm.copy())
@@ -275,6 +305,9 @@ class LiveSerialManager:
         self.record_start_telemetry: Dict = {}
         self.manual_recordings: Deque[Dict] = deque(maxlen=100)
         self.manual_record_index = 0
+
+        # Manual speed override (used when GPS speed is stale/unavailable)
+        self.manual_speed_kmh: Optional[float] = None
 
         self.connected_port: Optional[str] = None
         self.connected_baud: Optional[int] = None
@@ -332,6 +365,10 @@ class LiveSerialManager:
     def is_connected(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
+    def set_manual_speed(self, speed_kmh: Optional[float]) -> None:
+        with self._lock:
+            self.manual_speed_kmh = speed_kmh
+
     def start_recording(self) -> None:
         with self._lock:
             self.recording_active = True
@@ -347,6 +384,7 @@ class LiveSerialManager:
             self.record_chunks = []
             telem = self.record_start_telemetry
             self.manual_record_index += 1
+            active_spd, _ = _active_speed(telem, self.manual_speed_kmh)
             rec = {
                 "clip_id": self.manual_record_index,
                 "source": "manual",
@@ -357,7 +395,7 @@ class LiveSerialManager:
                 "lon": telem.get("lon"),
                 "utc": telem.get("utc"),
                 "gps_valid": telem.get("gps_valid"),
-                "speed_kmh": _extract_speed_kmh(telem),
+                "speed_kmh": active_spd,
                 "sample_rate_hz": self.sample_rate_hz,
                 "pcm16": pcm,
                 "duration_s": len(pcm) / float(self.sample_rate_hz) if pcm.size else 0.0,
@@ -413,12 +451,14 @@ class LiveSerialManager:
                     metrics["rms"] >= self.cfg.event_rms_threshold
                     and metrics["band_ratio"] >= self.cfg.event_band_ratio_threshold
                 )
+                active_spd, _ = _active_speed(self.latest_telemetry, self.manual_speed_kmh)
                 finalized = self.clip_recorder.process_frame(
                     pcm=pcm,
                     telemetry=self.latest_telemetry,
                     trigger_active=trigger_active,
                     trigger_reason="auto_squeal",
                     button_mark=False,
+                    speed_kmh=active_spd,
                 )
                 if finalized is not None:
                     self._event_rows.append({
@@ -765,13 +805,27 @@ def render_live_fragment(cfg: AppConfig) -> None:
     lon_val = latest_telem.get("lon")
     utc_val = latest_telem.get("utc")
     speed_kmh = _extract_speed_kmh(latest_telem)
-    speed_display = f"{speed_kmh:.1f} km/h" if speed_kmh is not None else "n/a"
+    manual_override = st.session_state.get("manual_speed_kmh") if st.session_state.get("use_manual_speed") else None
+    active_spd, spd_source = _active_speed(latest_telem, manual_override)
+
+    if spd_source == "gps":
+        speed_display = f"{active_spd:.1f} km/h"
+        speed_label = "Speed (GPS)"
+    elif spd_source == "gps_stale":
+        speed_display = f"{active_spd:.1f} km/h ⚠"
+        speed_label = "Speed (stale)"
+    elif spd_source == "manual":
+        speed_display = f"{active_spd:.1f} km/h"
+        speed_label = "Speed (manual)"
+    else:
+        speed_display = "n/a"
+        speed_label = "Speed"
 
     fm = status.get("last_frame_metrics", {})
     g1, g2, g3, g4, g5, g6, g7, g8 = st.columns(8)
     g1.metric("LAT", "n/a" if lat_val is None else f"{float(lat_val):.5f}")
     g2.metric("LON", "n/a" if lon_val is None else f"{float(lon_val):.5f}")
-    g3.metric("Speed", speed_display)
+    g3.metric(speed_label, speed_display)
     g4.metric("UTC", str(utc_val)[-8:] if utc_val else ("No fix" if not gps_valid else "n/a"))
     g5.metric("RMS", f"{float(fm.get('rms', 0.0)):.4f}")
     g6.metric("Band ratio", f"{float(fm.get('band_ratio', 0.0)):.3f}")
@@ -846,6 +900,25 @@ def render_live_tab(cfg: AppConfig) -> None:
                 st.success(f"Saved manual clip {rec['clip_id']} — {rec['duration_s']:.2f} s, RMS {rec['rms']:.4f}")
     with rec_cols[2]:
         st.caption("Auto clips are captured automatically when RMS + band-ratio thresholds are exceeded. Manual recording captures continuously between Start and Stop.")
+
+    # Speed override
+    spd_cols = st.columns([1.0, 1.0, 4.0])
+    with spd_cols[0]:
+        use_manual = st.checkbox("Override GPS speed", key="use_manual_speed")
+    with spd_cols[1]:
+        manual_val = st.number_input(
+            "km/h",
+            min_value=0.0, max_value=300.0,
+            value=st.session_state.get("manual_speed_kmh", 0.0),
+            step=0.5,
+            disabled=not use_manual,
+            key="manual_speed_kmh",
+            label_visibility="collapsed" if not use_manual else "visible",
+        )
+    if use_manual:
+        manager.set_manual_speed(float(manual_val))
+    else:
+        manager.set_manual_speed(None)
 
     render_live_fragment(cfg)
 
