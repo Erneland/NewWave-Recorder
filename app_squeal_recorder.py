@@ -814,7 +814,10 @@ def render_live_tab(cfg: AppConfig) -> None:
     with conn_cols[2]:
         if st.button("Connect", use_container_width=True):
             ok, msg = manager.connect(selected_port, int(baud))
-            st.success(msg) if ok else st.error(msg)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
     with conn_cols[3]:
         if st.button("Disconnect", use_container_width=True):
             manager.disconnect()
